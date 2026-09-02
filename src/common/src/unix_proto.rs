@@ -160,6 +160,24 @@ pub enum PamAuthRequest {
     },
     Pin {
         cred: String,
+        /// Request creation or refresh of the machine-sealed PIN wrapper that
+        /// may later be used after a successful fprintd verification. Older
+        /// PAM clients do not send this field and retain existing behaviour.
+        #[serde(default)]
+        store_biometric_pin: bool,
+        /// The local PAM username to bind to a newly created biometric PIN
+        /// wrapper. It is absent from legacy requests, which never opt in.
+        #[serde(default)]
+        biometric_username: Option<String>,
+    },
+    /// Request a server-side fprintd verification for this PAM authentication.
+    /// No biometric data crosses this IPC boundary, and the daemon performs
+    /// the match so a client cannot forge a successful verification.
+    Fingerprint {
+        /// The local PAM username fprintd uses to select enrolled prints. This
+        /// can differ from the normalized Entra account ID when user mapping is
+        /// configured.
+        username: String,
     },
     Fido {
         assertion: String,
@@ -411,4 +429,32 @@ fn test_legacy_mfa_code_request_aliases_to_input() {
         PamAuthRequest::Input { cred } => assert_eq!(cred, "123456"),
         other => panic!("expected Input request, got {:?}", other),
     }
+}
+
+#[test]
+fn test_legacy_pin_request_defaults_biometric_wrapper_to_disabled() {
+    let request: PamAuthRequest = serde_json::from_str(r#"{"Pin":{"cred":"123456"}}"#).unwrap();
+
+    match request {
+        PamAuthRequest::Pin {
+            cred,
+            store_biometric_pin,
+            biometric_username,
+        } => {
+            assert_eq!(cred, "123456");
+            assert!(!store_biometric_pin);
+            assert!(biometric_username.is_none());
+        }
+        other => panic!("expected Pin request, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_fingerprint_request_carries_only_the_local_username() {
+    let request = PamAuthRequest::Fingerprint {
+        username: "local-user".to_string(),
+    };
+    let serialized = serde_json::to_string(&request).unwrap();
+
+    assert_eq!(serialized, r#"{"Fingerprint":{"username":"local-user"}}"#);
 }

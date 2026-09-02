@@ -6,7 +6,7 @@
 Himmelblau
 .SH SYNOPSIS
 \f[B]pam_himmelblau.so\f[R] [debug] [use_first_pass]
-[ignore_unknown_user] [mfa_poll_prompt] [no_hello_pin] [no_info_prompt] [try_unseal]
+[ignore_unknown_user] [mfa_poll_prompt] [no_hello_pin] [no_info_prompt] [try_unseal] [fingerprint_reauth]
 .SH DESCRIPTION
 \f[B]pam_himmelblau\f[R] is a PAM module that authenticates users
 against Microsoft Azure Entra ID using the Himmelblau daemon
@@ -93,6 +93,26 @@ material because this non-interactive hook cannot collect the required
 TOTP.
 Use the normal interactive Himmelblau authentication flow when Hello
 TOTP is required.
+.IP \(bu 2
+\f[B]fingerprint_reauth\f[R]
+.PD 0
+.P
+.PD
+For a local, interactive Hello re-authentication, first verify a fingerprint
+enrolled for the PAM user through \f[CR]fprintd\f[R].
+On a successful match, Himmelblau uses a TPM machine-sealed Hello-PIN wrapper
+to unlock the existing Hello key and continue the normal Entra refresh or MFA
+flow.
+Himmelblau never receives or stores fingerprint templates.
+The first successful Hello PIN authentication with this option enables the
+wrapper for that account and binds it to that local PAM username.
+.PP
+This option is disabled by default and has no effect on initial sign-in,
+remote, \f[CR]use_first_pass\f[R], or \f[CR]try_unseal\f[R] authentication.
+A missing reader, enrollment, fprintd service, cancelled scan, or non-match
+immediately falls back to the normal Hello PIN prompt.
+It provides standard Linux PAM/fprintd assurance, not a hardware-bound
+biometric TPM authorization equivalent to a PIN.
 .SH PAM CONFIGURATION
 Configuring PAM ensures authentication requests go through Entra ID when
 appropriate.
@@ -132,6 +152,12 @@ auth        sufficient    pam_unix.so nullok try_first_pass
 auth        sufficient    pam_himmelblau.so ignore_unknown_user
 auth        required      pam_deny.so
 .EE
+.PP
+To enable fingerprint-first re-authentication for a specific local service,
+add \f[CR]fingerprint_reauth\f[R] to that service\(cqs
+\f[CR]pam_himmelblau.so\f[R] line.
+Install and enroll fingerprints with your distribution\(cqs \f[CR]fprintd\f[R]
+tools or desktop settings; Himmelblau does not manage enrollment.
 .PP
 Configure \f[CR]/etc/pam.d/common\-account\f[R] in a similar manner.
 .IP

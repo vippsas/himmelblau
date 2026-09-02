@@ -76,6 +76,9 @@ pub struct Options {
     pub no_info_prompt: bool,
     pub set_authtok: bool,
     pub try_unseal: bool,
+    /// Prefer a locally enrolled fingerprint for an interactive Hello
+    /// re-authentication. The normal Hello PIN remains the fallback.
+    pub fingerprint_reauth: bool,
     /// Only set by CLI (aad-tool auth-test --force-reauth), not parsed from PAM module arguments.
     pub force_reauth: bool,
 }
@@ -103,6 +106,7 @@ impl TryFrom<&Vec<&CStr>> for Options {
             no_info_prompt: gopts.contains("no_info_prompt"),
             set_authtok: gopts.contains("set_authtok") || gopts.contains("keyring_authtok"),
             try_unseal,
+            fingerprint_reauth: gopts.contains("fingerprint_reauth"),
             force_reauth: false,
         })
     }

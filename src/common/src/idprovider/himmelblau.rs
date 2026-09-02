@@ -2750,7 +2750,7 @@ impl IdProvider for HimmelblauProvider {
             }};
         }
         macro_rules! auth_and_validate_hello_key {
-            ($hello_key:ident, $keytype:ident, $cred:ident, $require_hello_totp:expr) => {{
+            ($hello_key:ident, $keytype:ident, $cred:ident, $require_hello_totp:expr, $store_biometric_pin:expr, $biometric_username:expr) => {{
                 // CRITICAL: Validate that we can load the key, otherwise the offline
                 // fallback will allow the user to authenticate with a bad PIN here.
                 // `acquire_token_by_hello_for_business_key` CAN (and probably will)
@@ -2778,6 +2778,19 @@ impl IdProvider for HimmelblauProvider {
                         AuthResult::Denied(tr("Failed to authenticate with Hello PIN.")),
                         AuthCacheAction::None,
                     ));
+                }
+                if $store_biometric_pin {
+                    let Some(biometric_username) = $biometric_username else {
+                        return Err(IdpError::BadRequest);
+                    };
+                    $crate::idprovider::common::store_biometric_hello_pin(
+                        account_id,
+                        &$cred,
+                        biometric_username,
+                        keystore,
+                        tpm,
+                        machine_key,
+                    )?;
                 }
 
                 // If an app_id is defined in the config, the app should have the
@@ -3686,16 +3699,63 @@ impl IdProvider for HimmelblauProvider {
                         IdpError::Tpm
                     })?;
 
-                auth_and_validate_hello_key!(hello_key, keytype, pin, require_hello_totp)
+                auth_and_validate_hello_key!(
+                    hello_key,
+                    keytype,
+                    pin,
+                    require_hello_totp,
+                    false,
+                    None
+                )
             }
-            (_, PamAuthRequest::Pin { cred }) => {
+            (
+                _,
+                PamAuthRequest::Pin {
+                    cred,
+                    store_biometric_pin,
+                    biometric_username,
+                },
+            ) => {
                 let (hello_key, keytype) =
                     self.fetch_hello_key(account_id, keystore)
                         .inspect_err(|_| {
                             error!("Online authentication failed. Hello key missing.");
                         })?;
 
-                auth_and_validate_hello_key!(hello_key, keytype, cred, require_hello_totp)
+                auth_and_validate_hello_key!(
+                    hello_key,
+                    keytype,
+                    cred,
+                    require_hello_totp,
+                    store_biometric_pin,
+                    biometric_username.as_deref()
+                )
+            }
+            (_, PamAuthRequest::Fingerprint { username }) => {
+                if !crate::fingerprint::verify_fingerprint(&username) {
+                    return Ok((AuthResult::Next(AuthRequest::Pin), AuthCacheAction::None));
+                }
+                let cred = match crate::idprovider::common::load_biometric_hello_pin(
+                    account_id,
+                    &username,
+                    keystore,
+                    tpm,
+                    machine_key,
+                ) {
+                    Ok(Some(cred)) => cred,
+                    Ok(None) | Err(_) => {
+                        return Ok((AuthResult::Next(AuthRequest::Pin), AuthCacheAction::None));
+                    }
+                };
+                let (hello_key, keytype) = self.fetch_hello_key(account_id, keystore)?;
+                auth_and_validate_hello_key!(
+                    hello_key,
+                    keytype,
+                    cred,
+                    require_hello_totp,
+                    false,
+                    None
+                )
             }
             // Sign-in frequency optimization: Password-first flow for console logins.
             // This handler validates password via ROPC, then checks PRT for sign-in

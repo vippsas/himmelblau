@@ -6,7 +6,7 @@
 
 # SYNOPSIS
 
-**pam_himmelblau.so** [debug] [use_first_pass] [ignore_unknown_user] [mfa_poll_prompt] [no_hello_pin] [no_info_prompt] [try_unseal]
+**pam_himmelblau.so** [debug] [use_first_pass] [ignore_unknown_user] [mfa_poll_prompt] [no_hello_pin] [no_info_prompt] [try_unseal] [fingerprint_reauth]
 
 # DESCRIPTION
 
@@ -34,6 +34,11 @@
 
 - **try_unseal**  
   Silently attempt to unseal the Hello secret using the password from a previous PAM module (similar to how `pam_gnome_keyring.so` unlocks the GNOME keyring at login). When Hello TOTP is disabled, the dedicated try_unseal path validates the PIN locally on every invocation and restores valid cached SSO material. If a cached Entra PRT has expired and the provider is online, the daemon uses the validated Hello key to request and cache a replacement PRT; an offline invocation remains local and fails only the unseal attempt. Authenticated user information is refreshed only when `cache_timeout` has elapsed and the provider supports a non-interactive refresh. Implies `use_first_pass` and `ignore_unknown_user`. Will never fail the PAM authentication stack and never wait for an answer, as it simply sends a request via IPC to himmelblaud. Intended for use with `user_map_file` setups where a local user logs in via `pam_unix` or another local auth flow, so that the Hello secret will be unsealed automatically, without requiring a manual `aad-tool` invocation. Requires the local user password to be identical to the himmelblau PIN. This option is incompatible with `enable_hello_totp = true`: the daemon logs an error and refuses the unseal before loading cached SSO material because this non-interactive hook cannot collect the required TOTP. Use the normal interactive Himmelblau authentication flow when Hello TOTP is required.
+
+- **fingerprint_reauth**
+  For a local, interactive Hello re-authentication, first verify a fingerprint enrolled for the PAM user through `fprintd`. On a successful match, Himmelblau uses a TPM machine-sealed Hello-PIN wrapper to unlock the existing Hello key and continue the normal Entra refresh or MFA flow. Himmelblau never receives or stores fingerprint templates. The first successful Hello PIN authentication with this option enables the wrapper for that account and binds it to that local PAM username.
+
+  This option is disabled by default and has no effect on initial sign-in, remote, `use_first_pass`, or `try_unseal` authentication. A missing reader, enrollment, fprintd service, cancelled scan, or non-match immediately falls back to the normal Hello PIN prompt. It provides standard Linux PAM/fprintd assurance, not a hardware-bound biometric TPM authorization equivalent to a PIN.
 
 # PAM CONFIGURATION
 
@@ -70,6 +75,11 @@ auth        sufficient    pam_unix.so nullok try_first_pass
 auth        sufficient    pam_himmelblau.so ignore_unknown_user
 auth        required      pam_deny.so
 ```
+
+To enable fingerprint-first re-authentication for a specific local service,
+add `fingerprint_reauth` to that service's `pam_himmelblau.so` line. Install
+and enroll fingerprints with your distribution's `fprintd` tools or desktop
+settings; Himmelblau does not manage enrollment.
 
 Configure `/etc/pam.d/common-account` in a similar manner.
 

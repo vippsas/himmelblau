@@ -1081,6 +1081,20 @@ fn handle_pam_auth_response_setup_pin(state: &AuthenticateState, msg: &str) -> P
 }
 
 fn handle_pam_auth_response_pin(state: &mut AuthenticateState) -> PamWhatNext {
+    let fingerprint_reauth_enabled = state.opts.fingerprint_reauth
+        && !state.opts.use_first_pass
+        && !state.opts.try_unseal
+        && !state.service.starts_with("remote:");
+    if fingerprint_reauth_enabled && !state.fingerprint_attempted && state.authtok.is_none() {
+        state.fingerprint_attempted = true;
+        state.msg_printer.print_text(&tr("Scan your fingerprint."));
+        return PamWhatNext::Next(ClientRequest::PamAuthenticateStep(
+            PamAuthRequest::Fingerprint {
+                username: state.fingerprint_username.to_owned(),
+            },
+        ));
+    }
+
     let mut consume_authtok = None;
     // Swap the authtok out with a None, so it can only be consumed once.
     // If it's already been swapped, we are just swapping two null pointers
@@ -1116,7 +1130,12 @@ fn handle_pam_auth_response_pin(state: &mut AuthenticateState) -> PamWhatNext {
     };
 
     // Now setup the request for the next loop.
-    let req = ClientRequest::PamAuthenticateStep(PamAuthRequest::Pin { cred });
+    let req = ClientRequest::PamAuthenticateStep(PamAuthRequest::Pin {
+        cred,
+        store_biometric_pin: fingerprint_reauth_enabled,
+        biometric_username: fingerprint_reauth_enabled
+            .then(|| state.fingerprint_username.to_owned()),
+    });
     PamWhatNext::Next(req)
 }
 
@@ -1395,6 +1414,8 @@ struct AuthenticateState {
     service: String,
     opts: Options,
     msg_printer: Arc<dyn MessagePrinter>,
+    fingerprint_username: String,
+    fingerprint_attempted: bool,
     poll_attempt: i32,
     polling_interval: u32,
 }
@@ -1487,6 +1508,7 @@ pub fn authenticate_with_client(
     service: &str,
     opts: Options,
     msg_printer: Arc<dyn MessagePrinter>,
+    fingerprint_username: Option<&str>,
 ) -> PamResultCode {
     i18n::init();
     let mut state = AuthenticateState {
@@ -1497,6 +1519,8 @@ pub fn authenticate_with_client(
         service: service.to_owned(),
         opts,
         msg_printer,
+        fingerprint_username: fingerprint_username.unwrap_or(account_id).to_owned(),
+        fingerprint_attempted: false,
         poll_attempt: -1,
         polling_interval: 2,
     };
@@ -1540,6 +1564,7 @@ pub fn authenticate(
         service,
         opts,
         msg_printer,
+        None,
     )
 }
 
@@ -1927,6 +1952,8 @@ mod tests {
                 service: "mariadb".to_string(),
                 opts: Options::default(),
                 msg_printer: printer,
+                fingerprint_username: "user@example.com".to_string(),
+                fingerprint_attempted: false,
                 poll_attempt: 0,
                 polling_interval: 0,
             },

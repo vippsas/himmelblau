@@ -15,7 +15,8 @@
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-use crate::idprovider::interface::IdpError;
+use crate::db::KeyStoreTxn;
+use crate::idprovider::interface::{tpm, IdpError};
 use kanidm_hsm_crypto::structures::SealedData;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -26,6 +27,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::sync::RwLock;
+use zeroize::Zeroizing;
 
 /// When a cached PRT is older than 4h, opportunistically issue an
 /// `exchange_prt_for_prt` before using it for access-token acquisition.
@@ -54,6 +56,82 @@ pub fn flip_displayname_comma(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+/// The wrapper holds a Hello PIN encrypted with the machine storage key. It is
+/// used only after the daemon has confirmed a fprintd match and is never a
+/// replacement for the user-facing PIN fallback.
+pub fn biometric_hello_pin_tag(account_id: &str) -> String {
+    format!("{}/hello_biometric_pin", account_id.to_lowercase())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BiometricHelloPinWrapper {
+    username: String,
+    sealed_pin: SealedData,
+}
+
+pub fn store_biometric_hello_pin<D: KeyStoreTxn + Send>(
+    account_id: &str,
+    pin: &str,
+    username: &str,
+    keystore: &mut D,
+    tpm: &mut tpm::provider::BoxedDynTpm,
+    machine_key: &tpm::structures::StorageKey,
+) -> Result<(), IdpError> {
+    let sealed_pin = tpm
+        .seal_data(machine_key, Zeroizing::new(pin.as_bytes().to_vec()))
+        .map_err(|err| {
+            error!(?err, "Failed to seal biometric Hello PIN wrapper");
+            IdpError::Tpm
+        })?;
+    let wrapper = BiometricHelloPinWrapper {
+        username: username.to_string(),
+        sealed_pin,
+    };
+    keystore
+        .insert_tagged_hsm_key(&biometric_hello_pin_tag(account_id), &wrapper)
+        .map_err(|err| {
+            error!(?err, "Failed to store biometric Hello PIN wrapper");
+            IdpError::Tpm
+        })
+}
+
+pub fn load_biometric_hello_pin<D: KeyStoreTxn + Send>(
+    account_id: &str,
+    username: &str,
+    keystore: &mut D,
+    tpm: &mut tpm::provider::BoxedDynTpm,
+    machine_key: &tpm::structures::StorageKey,
+) -> Result<Option<String>, IdpError> {
+    let wrapper: Option<BiometricHelloPinWrapper> = keystore
+        .get_tagged_hsm_key(&biometric_hello_pin_tag(account_id))
+        .map_err(|err| {
+            error!(?err, "Failed to load biometric Hello PIN wrapper");
+            IdpError::Tpm
+        })?;
+    let Some(wrapper) = wrapper else {
+        return Ok(None);
+    };
+    if wrapper.username != username {
+        return Ok(None);
+    }
+
+    let pin = tpm
+        .unseal_data(machine_key, &wrapper.sealed_pin)
+        .map_err(|err| {
+            error!(?err, "Failed to unseal biometric Hello PIN wrapper");
+            IdpError::Tpm
+        })?;
+    let pin = String::from_utf8(pin.to_vec()).map_err(|err| {
+        error!(?err, "Biometric Hello PIN wrapper was not valid UTF-8");
+        IdpError::Tpm
+    })?;
+    if pin.is_empty() {
+        error!("Biometric Hello PIN wrapper was empty");
+        return Err(IdpError::Tpm);
+    }
+    Ok(Some(pin))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +417,13 @@ macro_rules! handle_hello_bad_pin_count {
                     error!("Failed to delete hello refresh token: {:?}", e);
                     IdpError::Tpm
                 })?;
+            let biometric_pin_tag = $self.fetch_hello_biometric_pin_tag($account_id);
+            $keystore
+                .delete_tagged_hsm_key(&biometric_pin_tag)
+                .map_err(|e| {
+                    error!("Failed to delete biometric Hello PIN wrapper: {:?}", e);
+                    IdpError::Tpm
+                })?;
             return $ret_fn(
                 &tr("Too many incorrect PIN attempts. You will need to enroll a new Linux Hello PIN.")
             );
@@ -429,6 +514,10 @@ macro_rules! impl_himmelblau_hello_key_helpers {
 
         fn fetch_hello_totp_key_tag(&self, account_id: &str) -> String {
             format!("{}/hello_totp", account_id.to_lowercase())
+        }
+
+        fn fetch_hello_biometric_pin_tag(&self, account_id: &str) -> String {
+            $crate::idprovider::common::biometric_hello_pin_tag(account_id)
         }
     };
 }
@@ -773,7 +862,33 @@ macro_rules! check_hello_totp_enabled {
 macro_rules! impl_himmelblau_offline_auth_step {
     ($cred_handler:ident, $pam_next_req:expr, $self:ident, $account_id:ident, $keystore:ident, $tpm:ident, $machine_key:ident, $token:ident, $load_cached_prt:ident) => {{
         match (&$cred_handler, $pam_next_req) {
-            (_, PamAuthRequest::Pin { cred }) => {
+            (
+                _,
+                request @ (PamAuthRequest::Pin { .. } | PamAuthRequest::Fingerprint { .. }),
+            ) => {
+                let (cred, store_biometric_pin, biometric_username) = match request {
+                    PamAuthRequest::Pin {
+                        cred,
+                        store_biometric_pin,
+                        biometric_username,
+                    } => (cred, store_biometric_pin, biometric_username.as_deref()),
+                    PamAuthRequest::Fingerprint { username } => {
+                        if !$crate::fingerprint::verify_fingerprint(&username) {
+                            return Ok(AuthResult::Next(AuthRequest::Pin));
+                        }
+                        match $crate::idprovider::common::load_biometric_hello_pin(
+                            $account_id,
+                            &username,
+                            $keystore,
+                            $tpm,
+                            $machine_key,
+                        ) {
+                            Ok(Some(cred)) => (cred, false, None),
+                            Ok(None) | Err(_) => return Ok(AuthResult::Next(AuthRequest::Pin)),
+                        }
+                    }
+                    _ => return Err(IdpError::BadRequest),
+                };
                 let (hello_key, _keytype) =
                     $self.fetch_hello_key($account_id, $keystore).map_err(|e| {
                         error!("Offline authentication failed. Hello key missing.");
@@ -794,6 +909,19 @@ macro_rules! impl_himmelblau_offline_auth_step {
                 };
                 match $tpm.ms_hello_key_load($machine_key, &hello_key, &pin) {
                     Ok((_, win_hello_storage_key)) => {
+                        if store_biometric_pin {
+                            let Some(biometric_username) = biometric_username else {
+                                return Err(IdpError::BadRequest);
+                            };
+                            $crate::idprovider::common::store_biometric_hello_pin(
+                                $account_id,
+                                &cred,
+                                biometric_username,
+                                $keystore,
+                                $tpm,
+                                $machine_key,
+                            )?;
+                        }
                         $load_cached_prt!(
                             hello_key,
                             cred,
@@ -1333,6 +1461,14 @@ macro_rules! impl_change_auth_token {
             .delete_tagged_hsm_key(&hello_totp_tag)
             .map_err(|e| {
                 error!("Failed to delete hello TOTP: {:?}", e);
+                IdpError::Tpm
+            })?;
+
+        let biometric_pin_tag = $self.fetch_hello_biometric_pin_tag($account_id);
+        $keystore
+            .delete_tagged_hsm_key(&biometric_pin_tag)
+            .map_err(|e| {
+                error!("Failed to delete biometric Hello PIN wrapper: {:?}", e);
                 IdpError::Tpm
             })?;
 

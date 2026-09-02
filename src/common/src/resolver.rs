@@ -1920,7 +1920,9 @@ where
                         // AuthCredHandler::ChangePassword is invalid for offline auth
                         return Err(());
                     }
-                    (_, PamAuthRequest::Pin { .. }) | (_, PamAuthRequest::HelloTOTP { .. }) => {
+                    (_, PamAuthRequest::Pin { .. })
+                    | (_, PamAuthRequest::Fingerprint { .. })
+                    | (_, PamAuthRequest::HelloTOTP { .. }) => {
                         // The Pin acts as a single device password, and can be
                         // used to unlock the TPM to validate the authentication.
                         let mut hsm_lock = self.hsm.lock().await;

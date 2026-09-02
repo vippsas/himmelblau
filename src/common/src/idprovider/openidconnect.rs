@@ -324,6 +324,7 @@ fn pam_auth_request_kind(pam_next_req: &PamAuthRequest) -> &'static str {
         PamAuthRequest::Input { .. } => "input",
         PamAuthRequest::MFAPoll { .. } => "mfa_poll",
         PamAuthRequest::Pin { .. } => "pin",
+        PamAuthRequest::Fingerprint { .. } => "fingerprint",
         PamAuthRequest::SetupPin { .. } => "setup_pin",
         PamAuthRequest::HelloTOTP { .. } => "hello_totp",
         PamAuthRequest::Fido { .. } => "fido",
@@ -1409,6 +1410,8 @@ mod tests {
         let result = orchestrator_inputs_from_pam_request(
             PamAuthRequest::Pin {
                 cred: "1234".to_string(),
+                store_biometric_pin: false,
+                biometric_username: None,
             },
             &required_inputs,
         );
@@ -3133,7 +3136,7 @@ impl IdProvider for OidcProvider {
             hello_totp_enabled && (is_remote_service || !console_password_only);
 
         macro_rules! auth_and_validate_hello_key {
-            ($hello_key:ident, $keytype:ident, $cred:ident, $require_hello_totp:expr) => {{
+            ($hello_key:ident, $keytype:ident, $cred:ident, $require_hello_totp:expr, $store_biometric_pin:expr, $biometric_username:expr) => {{
                 // CRITICAL: Validate that we can load the key, otherwise the offline
                 // fallback will allow the user to authenticate with a bad PIN here.
                 let pin = match PinValue::new(&$cred) {
@@ -3158,6 +3161,19 @@ impl IdProvider for OidcProvider {
                         AuthResult::Denied(tr("Failed to authenticate with Hello PIN.")),
                         AuthCacheAction::None,
                     ));
+                }
+                if $store_biometric_pin {
+                    let Some(biometric_username) = $biometric_username else {
+                        return Err(IdpError::BadRequest);
+                    };
+                    $crate::idprovider::common::store_biometric_hello_pin(
+                        account_id,
+                        &$cred,
+                        biometric_username,
+                        keystore,
+                        tpm,
+                        machine_key,
+                    )?;
                 }
 
                 let hello_refresh_token_tag = self.fetch_hello_refresh_token_key_tag(account_id);
@@ -3288,6 +3304,14 @@ impl IdProvider for OidcProvider {
                                     error!("Failed to delete hello key: {:?}", e);
                                     IdpError::Tpm
                                 })?;
+                            let biometric_pin_tag =
+                                self.fetch_hello_biometric_pin_tag(account_id);
+                            keystore
+                                .delete_tagged_hsm_key(&biometric_pin_tag)
+                                .map_err(|e| {
+                                    error!("Failed to delete biometric Hello PIN wrapper: {:?}", e);
+                                    IdpError::Tpm
+                                })?;
                             // It's ok to reset the pin count here, since they must
                             // online auth at this point and create a new pin.
                             self.bad_pin_counter.reset_bad_pin_count(account_id).await;
@@ -3300,12 +3324,19 @@ impl IdProvider for OidcProvider {
                 } else {
                     error!("Unsupported Hello key type for online auth");
                     let hello_key_tag = self.fetch_hello_key_tag(account_id, false);
-                        keystore
+                    keystore
                             .delete_tagged_hsm_key(&hello_key_tag)
                             .map_err(|e| {
                                 error!("Failed to delete hello key: {:?}", e);
                                 IdpError::Tpm
                             })?;
+                    let biometric_pin_tag = self.fetch_hello_biometric_pin_tag(account_id);
+                    keystore
+                        .delete_tagged_hsm_key(&biometric_pin_tag)
+                        .map_err(|e| {
+                            error!("Failed to delete biometric Hello PIN wrapper: {:?}", e);
+                            IdpError::Tpm
+                        })?;
                     return Ok((
                         AuthResult::Denied(tr("Your session has expired. Please sign in again.")),
                         AuthCacheAction::None,
@@ -3435,7 +3466,14 @@ impl IdProvider for OidcProvider {
                         IdpError::Tpm
                     })?;
 
-                auth_and_validate_hello_key!(hello_key, keytype, cred, require_hello_totp)
+                auth_and_validate_hello_key!(
+                    hello_key,
+                    keytype,
+                    cred,
+                    require_hello_totp,
+                    false,
+                    None
+                )
             }
             (AuthCredHandler::PasswordFirst { .. }, PamAuthRequest::Password { cred }) => {
                 // Wrap the wire-delivered credential so this copy (and the clone
@@ -3483,14 +3521,54 @@ impl IdProvider for OidcProvider {
                     }
                 }
             }
-            (_, PamAuthRequest::Pin { cred }) => {
+            (
+                _,
+                PamAuthRequest::Pin {
+                    cred,
+                    store_biometric_pin,
+                    biometric_username,
+                },
+            ) => {
                 let (hello_key, keytype) =
                     self.fetch_hello_key(account_id, keystore)
                         .inspect_err(|_| {
                             error!("Online authentication failed. Hello key missing.");
                         })?;
 
-                auth_and_validate_hello_key!(hello_key, keytype, cred, require_hello_totp)
+                auth_and_validate_hello_key!(
+                    hello_key,
+                    keytype,
+                    cred,
+                    require_hello_totp,
+                    store_biometric_pin,
+                    biometric_username.as_deref()
+                )
+            }
+            (_, PamAuthRequest::Fingerprint { username }) => {
+                if !crate::fingerprint::verify_fingerprint(&username) {
+                    return Ok((AuthResult::Next(AuthRequest::Pin), AuthCacheAction::None));
+                }
+                let cred = match crate::idprovider::common::load_biometric_hello_pin(
+                    account_id,
+                    &username,
+                    keystore,
+                    tpm,
+                    machine_key,
+                ) {
+                    Ok(Some(cred)) => cred,
+                    Ok(None) | Err(_) => {
+                        return Ok((AuthResult::Next(AuthRequest::Pin), AuthCacheAction::None));
+                    }
+                };
+                let (hello_key, keytype) = self.fetch_hello_key(account_id, keystore)?;
+                auth_and_validate_hello_key!(
+                    hello_key,
+                    keytype,
+                    cred,
+                    require_hello_totp,
+                    false,
+                    None
+                )
             }
             (
                 AuthCredHandler::MFA {

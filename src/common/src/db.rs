@@ -554,7 +554,8 @@ impl<'a> CacheTxn for DbTxn<'a> {
                     OR key LIKE '%/hello_decoupled'
                     OR key LIKE '%/hello_prt'
                     OR key LIKE '%/hello_refresh_token'
-                    OR key LIKE '%/hello_totp'",
+                    OR key LIKE '%/hello_totp'
+                    OR key LIKE '%/hello_biometric_pin'",
                 [],
             )
             .map_err(|e| self.sqlite_error("delete hello keys", &e))?;

@@ -382,7 +382,7 @@ impl PamHooks for PamKanidm {
             service
         };
 
-        let account_id = match pamh.get_user(None) {
+        let pam_username = match pamh.get_user(None) {
             Ok(aid) => aid,
             Err(e) => {
                 error!(err = ?e, "get_user");
@@ -395,9 +395,9 @@ impl PamHooks for PamKanidm {
             Err(e) => return e,
         };
         let user_map = UserMap::new(&cfg.get_user_map_file());
-        let account_id = match user_map.get_upn_from_local(&account_id) {
+        let account_id = match user_map.get_upn_from_local(&pam_username) {
             Some(account_id) => account_id,
-            None => match cfg.map_name_to_upn(&account_id) {
+            None => match cfg.map_name_to_upn(&pam_username) {
                 Some(upn) => upn,
                 None => return PamResultCode::PAM_IGNORE,
             },
@@ -480,6 +480,7 @@ impl PamHooks for PamKanidm {
             &service,
             opts,
             msg_printer,
+            Some(&pam_username),
         );
 
         if set_authtok && result == PamResultCode::PAM_SUCCESS {
